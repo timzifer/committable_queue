@@ -57,6 +57,10 @@ func (d *deque[T]) popFront() (zero T, _ bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	return d.popFrontLocked()
+}
+
+func (d *deque[T]) popFrontLocked() (zero T, _ bool) {
 	if d.len == 0 {
 		return zero, false
 	}
@@ -81,6 +85,10 @@ func (d *deque[T]) popBack() (zero T, _ bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	return d.popBackLocked()
+}
+
+func (d *deque[T]) popBackLocked() (zero T, _ bool) {
 	if d.len == 0 {
 		return zero, false
 	}
@@ -131,6 +139,8 @@ func (d *deque[T]) appendLocked(other *deque[T]) {
 type segmentedQueueOptions[T any] struct {
 	initialVisible []T
 	initialPending []T
+	options        Options
+	hasOptions     bool
 }
 
 type SegmentedQueueOption[T any] func(*segmentedQueueOptions[T])
@@ -147,21 +157,34 @@ func WithInitialPending[T any](values ...T) SegmentedQueueOption[T] {
 	}
 }
 
+func WithOptions[T any](options Options) SegmentedQueueOption[T] {
+	return func(opts *segmentedQueueOptions[T]) {
+		opts.options = options
+		opts.hasOptions = true
+	}
+}
+
 type SegmentedQueue[T any] struct {
 	visible *deque[T]
 	pending *deque[T]
 	mu      sync.Mutex
 	opts    segmentedQueueOptions[T]
+	options Options
 }
 
 func NewSegmentedQueue[T any](options ...SegmentedQueueOption[T]) *SegmentedQueue[T] {
 	sq := &SegmentedQueue[T]{
 		visible: newDeque[T](),
 		pending: newDeque[T](),
+		options: defaultOptions(),
 	}
 
 	for _, opt := range options {
 		opt(&sq.opts)
+	}
+
+	if sq.opts.hasOptions {
+		sq.options = sq.opts.options
 	}
 
 	for _, v := range sq.opts.initialVisible {
@@ -202,6 +225,17 @@ func (sq *SegmentedQueue[T]) Commit() {
 	sq.pending.mu.Lock()
 
 	sq.visible.appendLocked(sq.pending)
+
+	if sq.options.MaxLen > 0 {
+		for sq.visible.len > sq.options.MaxLen {
+			switch sq.options.DropPolicy {
+			case DropNewest:
+				sq.visible.popBackLocked()
+			default:
+				sq.visible.popFrontLocked()
+			}
+		}
+	}
 
 	sq.pending.mu.Unlock()
 	sq.visible.mu.Unlock()
