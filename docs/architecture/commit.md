@@ -1,29 +1,83 @@
-# Commit-Orchestrierung
+# Commit Orchestration
 
-Dieses Dokument beschreibt das Commit-Protokoll der Queue-Banken und den orchestrierten Ablauf im Commit-Orchestrator.
+This document explains how the commit protocol coordinates multiple queue banks
+so that each commit attempt is atomic, ordered, and observable.
 
-## Stop-the-world-Phase
+## Stop-the-world phase
 
-* **Globale Sperre:** `CommitAll` erwirbt eine Prozess-weite Mutex. Solange die Sperre gehalten wird, können keine weiteren Writer (`CommitAll`-Aufrufe) starten und Reader sehen weiterhin den letzten vollständig committed Zustand.
-* **Frozen Reader:** Während die Sperre gehalten wird, wird kein neuer Versionsstand veröffentlicht. Reader greifen somit weiter auf den bisherigen Snapshot zu.
-* **Kontextunterstützung:** Der Aufruf akzeptiert einen `context.Context`. Kontext-Abbrüche werden während der Stop-the-world-Phase geprüft, um blockierende Commits rechtzeitig abzubrechen.
+* **Global writer lock:** `CommitAll` acquires a process-wide mutex. While the
+  lock is held, no other writer (`CommitAll` invocation) can start, and readers
+  continue to observe the last successfully published snapshot.
+* **Reader freeze:** No new version is published while the lock is held. Readers
+  therefore operate on the previously exposed state and remain isolated from the
+  commit attempt in progress.
+* **Context awareness:** The call accepts a `context.Context`. Cancellation is
+  checked before and after blocking operations so that a stalled commit can be
+  abandoned promptly, releasing the global lock for the next writer.
 
-## Zwei-Phasen-Protokoll
+## Two-phase protocol
 
-1. **Prepare:** Jede Bank implementiert `PrepareCommit`. Der Orchestrator ruft diese Funktion seriell auf und sammelt Publish-/Abort-Callbacks. In dieser Phase werden Pending-Segmente lediglich ausgestaged – sichtbare Daten bleiben unverändert.
-2. **Abort bei Fehlern:** Tritt während `PrepareCommit` ein Fehler auf oder wird der Kontext abgebrochen, führt der Orchestrator alle bis dahin gesammelten Abort-Callbacks in umgekehrter Reihenfolge aus. Dadurch werden ausgestagte Daten wieder in den Pending-Bereich zurückgeführt.
-3. **Publish:** Nur wenn alle Banken erfolgreich vorbereitet wurden und der Kontext weiterhin aktiv ist, ruft der Orchestrator die Publish-Callbacks in Registrierungsreihenfolge auf. Erst jetzt werden neue Daten sichtbar gemacht.
-4. **Version erhöhen:** Nach erfolgreichem Publish aller Banken wird die globale Version atomar erhöht und Reader können auf den neuen Snapshot wechseln.
+1. **Prepare:** Each bank implements `PrepareCommit`. The orchestrator invokes
+   these methods serially and collects pairs of publish/abort callbacks. During
+   this stage, pending registers are only staged—readers still see the last
+   committed values.
+2. **Abort on failure:** If a bank returns an error from `PrepareCommit`, or if
+   the context has been cancelled, the orchestrator executes all collected abort
+   callbacks in reverse order. This rolls staged data back into the pending
+   buffers.
+3. **Publish:** Only when all banks report success (and the context remains
+   active) does the orchestrator invoke the publish callbacks in the order they
+   were registered. The callbacks copy staged data into their published
+   registers, making the new snapshot visible.
+4. **Version bump:** After every bank publishes successfully, the orchestrator
+   atomically increments the global version counter so that readers can detect
+   the availability of a new snapshot.
 
-## Fehlerbehandlung
+The prepare/publish split ensures that banks never expose partial state, even if
+they maintain distinct storage backends or transport layers.
 
-* **Kurzschluss:** Schlägt eine `PrepareCommit`-Phase fehl, werden verbleibende Banken nicht mehr aufgerufen und alle bereits vorbereiteten Banken rollen ihren Zustand via Abort zurück.
-* **Garantiertes Rollback:** Da das Publish erst nach erfolgreichem Abschluss aller Prepare-Phasen erfolgt, können keine partiellen Zustände sichtbar werden. Aborts stellen sicher, dass alle Pending-Daten erhalten bleiben.
-* **Metriken & Tracing:** Jeder Commit-Versuch meldet Dauer und Fehlversuche an `internal/telemetry/commit_metrics.go`. Fehlversuche werden gezählt und können von außen beobachtet werden.
-* **Fehlerpropagierung:** Der Fehler der Bank wird unverändert an den Aufrufer von `CommitAll` zurückgegeben. Zusätzlich bricht ein abgebrochener Kontext den Commit mit dem jeweiligen Kontextfehler ab.
+## Failure handling and observability
 
-## Deterministische Mehrregister-Lesevorgänge
+* **Short-circuiting:** When a `PrepareCommit` call fails, the orchestrator stops
+  iterating over the remaining banks and immediately initiates rollback.
+* **Guaranteed rollback:** Because the publish callbacks have not yet executed,
+  no bank has surfaced staged data. Abort callbacks restore the pending state so
+  that the next commit attempt starts from a consistent baseline.
+* **Metrics:** Each commit attempt reports duration, success, and failure counts
+  via `internal/telemetry/commit_metrics.go`. These counters feed the exported
+  metrics registry and can be scraped by monitoring tools.
+* **Error propagation:** A bank error is returned unchanged to the caller of
+  `CommitAll`. If the context is cancelled, the orchestrator propagates the
+  context error instead, allowing upstream services to correlate the failure.
 
-* **Versionskonsistenz:** Multi-Register-Reader (z. B. Modbus-Clients) dürfen nur Wertepaare verarbeiten, deren `Version` und `Timestamp` identisch sind. Sichtbare Register werden erst nach erfolgreichem `CommitAll` aktualisiert.
-* **Staging der Writer:** Writer aktualisieren pro Bank zunächst Pending-Register. `PrepareCommit` übernimmt diese Werte nur temporär; bei einem Fehlschlag werden sie wieder in Pending überführt.
-* **Sichtbarkeit:** Während `CommitAll` läuft, bleiben Reader auf dem zuletzt veröffentlichten Snapshot. Erst wenn alle Banken published und die globale Version erhöht wurde, erscheinen die neuen Registerwerte atomar für alle beteiligten Banken.
+### Timeline of a commit attempt
+
+```
+Acquire writer lock → Check context → Prepare bank A → … → Prepare bank N
+         ↘ error? abort prepared banks ↴                   ↘ success
+          Release lock, return error              Publish banks in order
+                                                  Increment global version
+                                                  Release lock, return nil
+```
+
+This timeline highlights the serialization guarantees: only one writer proceeds
+at a time, and any failure skips the publish branch entirely.
+
+## Deterministic multi-register reads
+
+* **Version consistency:** Multi-register readers (for example, Modbus clients)
+  must process values whose `Version` and `Timestamp` fields match. Visible
+  registers change only after `CommitAll` finishes successfully.
+* **Writer staging:** Writers update pending registers for each bank. During
+  `PrepareCommit`, those values are staged temporarily; if a failure occurs, the
+  abort callbacks rehydrate the pending buffers.
+* **Visibility:** While `CommitAll` is executing, readers stay on the last
+  published snapshot. Only after every bank publishes and the global version is
+  incremented do the new register values become atomically visible.
+
+## Related components
+
+* `internal/core/commit.go` contains the orchestrator and its lock management.
+* `queue/fixtures` provides in-memory test doubles that exercise the protocol.
+* `tests/commit_all_test.go` (and related suites) validate the stop-the-world
+  semantics, error propagation, and version sequencing described above.
