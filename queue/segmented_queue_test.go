@@ -278,3 +278,171 @@ func TestSegmentedQueuePrepareCommitRespectsContext(t *testing.T) {
 		t.Fatalf("pending element should remain after cancelled prepare, got %v,%v", v, ok)
 	}
 }
+
+func TestSegmentedQueuePushFrontPendingOnEmpty(t *testing.T) {
+	q := NewSegmentedQueue[int]()
+	q.PushFrontPending(1)
+	if got := q.LenVisible(); got != 0 {
+		t.Fatalf("visible segment should remain empty, got len %d", got)
+	}
+
+	publish, abort, err := q.PrepareCommit(context.Background())
+	if err != nil {
+		t.Fatalf("prepare failed: %v", err)
+	}
+	if publish == nil {
+		t.Fatalf("expected publish callback")
+	}
+	if abort == nil {
+		t.Fatalf("expected abort callback")
+	}
+}
+
+func TestSegmentedQueuePopBackEmpty(t *testing.T) {
+	q := NewSegmentedQueue[int]()
+	if _, ok := q.PopBack(); ok {
+		t.Fatalf("expected PopBack on empty queue to fail")
+	}
+}
+
+func TestSegmentedQueueCommitWithContextErrorPanics(t *testing.T) {
+	q := NewSegmentedQueue[int]()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatalf("expected panic from commitWithContext on cancelled context")
+		}
+	}()
+
+	q.commitWithContext(ctx)
+}
+
+func TestSegmentedQueuePublishIdempotent(t *testing.T) {
+	q := NewSegmentedQueue[int]()
+	q.PushBackPending(42)
+
+	publish, abort, err := q.PrepareCommit(context.Background())
+	if err != nil {
+		t.Fatalf("prepare failed: %v", err)
+	}
+	if abort == nil {
+		t.Fatalf("expected abort callback")
+	}
+
+	publish()
+	if got := q.LenVisible(); got != 1 {
+		t.Fatalf("expected single element after publish, got %d", got)
+	}
+
+	publish()
+	if got := q.LenVisible(); got != 1 {
+		t.Fatalf("publish should be idempotent, got visible len %d", got)
+	}
+
+	empty := &stagedCommit[int]{queue: q}
+	empty.Publish()
+}
+
+func TestSegmentedQueueAbortIdempotent(t *testing.T) {
+	q := NewSegmentedQueue[int]()
+	q.PushBackPending(1)
+	publish, abort, err := q.PrepareCommit(context.Background())
+	if err != nil {
+		t.Fatalf("prepare failed: %v", err)
+	}
+	if publish == nil || abort == nil {
+		t.Fatalf("expected publish and abort callbacks")
+	}
+
+	abort()
+	abort()
+
+	empty := &stagedCommit[int]{queue: q}
+	empty.Abort()
+}
+
+func TestSegmentedQueueAbortRestoresWhenPendingEmpty(t *testing.T) {
+	q := NewSegmentedQueue[int]()
+	q.PushBackPending(7)
+	q.PushBackPending(8)
+
+	publish, abort, err := q.PrepareCommit(context.Background())
+	if err != nil {
+		t.Fatalf("prepare failed: %v", err)
+	}
+	if publish == nil || abort == nil {
+		t.Fatalf("expected callbacks from prepare")
+	}
+
+	abort()
+
+	if got := q.LenVisible(); got != 0 {
+		t.Fatalf("abort should not modify visible segment, got len %d", got)
+	}
+
+	if v, ok := q.PopFront(); ok {
+		t.Fatalf("visible segment should remain empty, got value %v", v)
+	}
+
+	if got := q.pending.length(); got != 2 {
+		t.Fatalf("pending length should be restored to 2, got %d", got)
+	}
+}
+
+func TestDequeAppendLocked(t *testing.T) {
+	dst := newDeque[int]()
+	other := newDeque[int]()
+
+	dst.mu.Lock()
+	other.mu.Lock()
+	dst.appendLocked(other)
+	other.mu.Unlock()
+	dst.mu.Unlock()
+
+	if dst.length() != 0 {
+		t.Fatalf("append from empty deque should keep destination empty")
+	}
+
+	other.pushBack(1)
+	dst.mu.Lock()
+	other.mu.Lock()
+	dst.appendLocked(other)
+	other.mu.Unlock()
+	dst.mu.Unlock()
+
+	if dst.length() != 1 {
+		t.Fatalf("expected destination length 1, got %d", dst.length())
+	}
+	if other.length() != 0 {
+		t.Fatalf("source should be cleared after append, got len %d", other.length())
+	}
+
+	other.pushBack(2)
+	other.pushBack(3)
+	dst.mu.Lock()
+	other.mu.Lock()
+	dst.appendLocked(other)
+	other.mu.Unlock()
+	dst.mu.Unlock()
+
+	values := []int{}
+	for {
+		v, ok := dst.popFront()
+		if !ok {
+			break
+		}
+		values = append(values, v)
+	}
+
+	expected := []int{1, 2, 3}
+	if len(values) != len(expected) {
+		t.Fatalf("unexpected number of values: %v", values)
+	}
+	for i, want := range expected {
+		if values[i] != want {
+			t.Fatalf("expected %v, got %v", expected, values)
+		}
+	}
+}
