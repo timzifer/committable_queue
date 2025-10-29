@@ -54,45 +54,10 @@ jobs:
           COVERAGE: ${{ steps.coverage.outputs.percent }}
         run: |
           mkdir -p .github/badges
-          badge_color=$(python - <<'PY'
-import os
-value = float(os.environ.get('COVERAGE') or 0.0)
-if value >= 90:
-    color = 'brightgreen'
-elif value >= 80:
-    color = 'green'
-elif value >= 70:
-    color = 'yellowgreen'
-elif value >= 60:
-    color = 'yellow'
-elif value >= 50:
-    color = 'orange'
-else:
-    color = 'red'
-print(color)
-PY
-)
-          badge_text=$(python - <<'PY'
-import os
-from urllib.parse import quote
-value = float(os.environ.get('COVERAGE') or 0.0)
-print(quote(f"{value:.1f}%"))
-PY
-)
+          badge_color=$(python -c "import os; value=float(os.environ.get('COVERAGE') or 0.0);\nif value >= 90: color='brightgreen'\nelif value >= 80: color='green'\nelif value >= 70: color='yellowgreen'\nelif value >= 60: color='yellow'\nelif value >= 50: color='orange'\nelse: color='red'\nprint(color)")
+          badge_text=$(python -c "import os; from urllib.parse import quote; value=float(os.environ.get('COVERAGE') or 0.0); print(quote(f'{value:.1f}%'))")
           curl -sSfL "https://img.shields.io/badge/coverage-${badge_text}-${badge_color}.svg" -o .github/badges/coverage.svg
-          BADGE_COLOR="$badge_color" python - <<'PY'
-import json
-import os
-value = float(os.environ.get('COVERAGE') or 0.0)
-color = os.environ.get('BADGE_COLOR', 'lightgrey')
-with open('.github/badges/coverage.json', 'w', encoding='utf-8') as fh:
-    json.dump({
-        'schemaVersion': 1,
-        'label': 'coverage',
-        'message': f"{value:.1f}%",
-        'color': color
-    }, fh)
-PY
+          BADGE_COLOR="$badge_color" python -c "import json, os, pathlib; value=float(os.environ.get('COVERAGE') or 0.0); color=os.environ.get('BADGE_COLOR', 'lightgrey'); data={'schemaVersion': 1, 'label': 'coverage', 'message': f'{value:.1f}%', 'color': color}; pathlib.Path('.github/badges/coverage.json').write_text(json.dumps(data), encoding='utf-8')"
 
       - name: Commit coverage badge
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
