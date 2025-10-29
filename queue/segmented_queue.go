@@ -1,6 +1,7 @@
 package queue
 
 import (
+	"context"
 	"sync"
 )
 
@@ -218,13 +219,129 @@ func (sq *SegmentedQueue[T]) PushFrontPending(value T) {
 }
 
 func (sq *SegmentedQueue[T]) Commit() {
+	publish, _, err := sq.PrepareCommit(context.Background())
+	if err != nil {
+		panic(err)
+	}
+	if publish != nil {
+		publish()
+	}
+}
+
+func (sq *SegmentedQueue[T]) PrepareCommit(ctx context.Context) (publish func(), abort func(), err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+
+	sq.mu.Lock()
+	defer sq.mu.Unlock()
+
+	sq.pending.mu.Lock()
+	stagedHead := sq.pending.head
+	stagedTail := sq.pending.tail
+	stagedLen := sq.pending.len
+
+	if stagedLen == 0 {
+		sq.pending.mu.Unlock()
+		return nil, nil, nil
+	}
+
+	sq.pending.head = nil
+	sq.pending.tail = nil
+	sq.pending.len = 0
+
+	if stagedHead != nil {
+		stagedHead.prev = nil
+	}
+	if stagedTail != nil {
+		stagedTail.next = nil
+	}
+
+	sq.pending.mu.Unlock()
+
+	staged := &stagedCommit[T]{
+		queue: sq,
+		head:  stagedHead,
+		tail:  stagedTail,
+		len:   stagedLen,
+	}
+
+	return staged.Publish, staged.Abort, nil
+}
+
+type stagedCommit[T any] struct {
+	queue *SegmentedQueue[T]
+	head  *node[T]
+	tail  *node[T]
+	len   int
+
+	mu   sync.Mutex
+	done bool
+}
+
+func (sc *stagedCommit[T]) Publish() {
+	sc.mu.Lock()
+	if sc.done {
+		sc.mu.Unlock()
+		return
+	}
+	sc.done = true
+	head, tail, length := sc.head, sc.tail, sc.len
+	sc.mu.Unlock()
+
+	if length == 0 {
+		return
+	}
+
+	sc.queue.finalizePublish(head, tail, length)
+
+	sc.mu.Lock()
+	sc.head = nil
+	sc.tail = nil
+	sc.len = 0
+	sc.mu.Unlock()
+}
+
+func (sc *stagedCommit[T]) Abort() {
+	sc.mu.Lock()
+	if sc.done {
+		sc.mu.Unlock()
+		return
+	}
+	sc.done = true
+	head, tail, length := sc.head, sc.tail, sc.len
+	sc.mu.Unlock()
+
+	if length == 0 {
+		return
+	}
+
+	sc.queue.finalizeAbort(head, tail, length)
+
+	sc.mu.Lock()
+	sc.head = nil
+	sc.tail = nil
+	sc.len = 0
+	sc.mu.Unlock()
+}
+
+func (sq *SegmentedQueue[T]) finalizePublish(head, tail *node[T], length int) {
 	sq.mu.Lock()
 	defer sq.mu.Unlock()
 
 	sq.visible.mu.Lock()
-	sq.pending.mu.Lock()
+	defer sq.visible.mu.Unlock()
 
-	sq.visible.appendLocked(sq.pending)
+	if sq.visible.len == 0 {
+		sq.visible.head = head
+		sq.visible.tail = tail
+		sq.visible.len = length
+	} else {
+		head.prev = sq.visible.tail
+		sq.visible.tail.next = head
+		sq.visible.tail = tail
+		sq.visible.len += length
+	}
 
 	if sq.options.MaxLen > 0 {
 		for sq.visible.len > sq.options.MaxLen {
@@ -236,7 +353,25 @@ func (sq *SegmentedQueue[T]) Commit() {
 			}
 		}
 	}
+}
 
-	sq.pending.mu.Unlock()
-	sq.visible.mu.Unlock()
+func (sq *SegmentedQueue[T]) finalizeAbort(head, tail *node[T], length int) {
+	sq.mu.Lock()
+	defer sq.mu.Unlock()
+
+	sq.pending.mu.Lock()
+	defer sq.pending.mu.Unlock()
+
+	if sq.pending.len == 0 {
+		sq.pending.head = head
+		sq.pending.tail = tail
+		sq.pending.len = length
+		return
+	}
+
+	existingHead := sq.pending.head
+	existingHead.prev = tail
+	tail.next = existingHead
+	sq.pending.head = head
+	sq.pending.len += length
 }

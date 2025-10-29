@@ -33,15 +33,33 @@ func newRegisterBank(name string, initial registerState) *registerBank {
 	return &registerBank{name: name, visible: initial}
 }
 
-func (b *registerBank) Commit(ctx context.Context) error {
+func (b *registerBank) PrepareCommit(ctx context.Context) (func(), func(), error) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	if b.hasPending {
-		b.visible = b.pending
-		b.hasPending = false
+	if !b.hasPending {
+		b.mu.Unlock()
+		return func() {}, nil, nil
 	}
-	return nil
+
+	staged := b.pending
+	b.hasPending = false
+	b.mu.Unlock()
+
+	publish := func() {
+		b.mu.Lock()
+		b.visible = staged
+		b.mu.Unlock()
+	}
+
+	abort := func() {
+		b.mu.Lock()
+		if !b.hasPending {
+			b.pending = staged
+			b.hasPending = true
+		}
+		b.mu.Unlock()
+	}
+
+	return publish, abort, nil
 }
 
 func (b *registerBank) updatePending(state registerState) {
