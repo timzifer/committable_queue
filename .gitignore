@@ -14,6 +14,8 @@
 # Code coverage profiles and other test artifacts
 *.out
 coverage.*
+!/.github/badges/coverage.svg
+!/.github/badges/coverage.json
 *.coverprofile
 profile.cov
 
