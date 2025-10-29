@@ -218,14 +218,18 @@ func (sq *SegmentedQueue[T]) PushFrontPending(value T) {
 	sq.pending.pushFront(value)
 }
 
-func (sq *SegmentedQueue[T]) Commit() {
-	publish, _, err := sq.PrepareCommit(context.Background())
+func (sq *SegmentedQueue[T]) commitWithContext(ctx context.Context) {
+	publish, _, err := sq.PrepareCommit(ctx)
 	if err != nil {
 		panic(err)
 	}
 	if publish != nil {
 		publish()
 	}
+}
+
+func (sq *SegmentedQueue[T]) Commit() {
+	sq.commitWithContext(context.Background())
 }
 
 func (sq *SegmentedQueue[T]) PrepareCommit(ctx context.Context) (publish func(), abort func(), err error) {
