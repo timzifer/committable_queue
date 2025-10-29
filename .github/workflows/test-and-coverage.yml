@@ -1,0 +1,67 @@
+name: Test and Coverage
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run unit tests with coverage
+        run: go test -coverprofile=coverage.out ./...
+
+      - name: Run orchestrator benchmarks
+        run: go test -bench=. -benchtime=100ms ./internal/core
+
+      - name: Run orchestrator fuzz smoke test
+        run: go test -run=^$ -fuzz=FuzzCommitAll -fuzztime=5s ./internal/core
+
+      - name: Summarize coverage
+        id: coverage
+        run: |
+          go tool cover -func=coverage.out -o coverage.txt
+          total_line=$(grep 'total:' coverage.txt)
+          pct=$(echo "$total_line" | awk '{print substr($3, 1, length($3)-1)}')
+          printf 'percent=%s\n' "$pct" >> "$GITHUB_OUTPUT"
+          {
+            echo '### Coverage summary'
+            echo
+            echo "* Total: ${pct}%"
+            echo
+            echo '```'
+            cat coverage.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build coverage badge assets
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          COVERAGE: ${{ steps.coverage.outputs.percent }}
+        run: |
+          mkdir -p .github/badges
+          badge_color=$(python -c "import os; value=float(os.environ.get('COVERAGE') or 0.0);\nif value >= 90: color='brightgreen'\nelif value >= 80: color='green'\nelif value >= 70: color='yellowgreen'\nelif value >= 60: color='yellow'\nelif value >= 50: color='orange'\nelse: color='red'\nprint(color)")
+          badge_text=$(python -c "import os; from urllib.parse import quote; value=float(os.environ.get('COVERAGE') or 0.0); print(quote(f'{value:.1f}%'))")
+          curl -sSfL "https://img.shields.io/badge/coverage-${badge_text}-${badge_color}.svg" -o .github/badges/coverage.svg
+          BADGE_COLOR="$badge_color" python -c "import json, os, pathlib; value=float(os.environ.get('COVERAGE') or 0.0); color=os.environ.get('BADGE_COLOR', 'lightgrey'); data={'schemaVersion': 1, 'label': 'coverage', 'message': f'{value:.1f}%', 'color': color}; pathlib.Path('.github/badges/coverage.json').write_text(json.dumps(data), encoding='utf-8')"
+
+      - name: Commit coverage badge
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: 'chore: update coverage badge'
+          file_pattern: .github/badges/coverage.svg .github/badges/coverage.json

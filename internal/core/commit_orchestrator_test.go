@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -218,4 +219,228 @@ func TestCommitAllAbortsOnFailure(t *testing.T) {
 	if failures != 1 {
 		t.Fatalf("unexpected failure count: got %d want %d", failures, 1)
 	}
+}
+
+func TestCommitAllAbortsInReverseOrder(t *testing.T) {
+	telemetry.DefaultCommitMetrics().Reset()
+
+	var abortOrder []int
+	var mu sync.Mutex
+
+	makeBank := func(id int) Bank {
+		return bankFunc(func(ctx context.Context) (func(), func(), error) {
+			publish := func() {}
+			abort := func() {
+				mu.Lock()
+				abortOrder = append(abortOrder, id)
+				mu.Unlock()
+			}
+			return publish, abort, nil
+		})
+	}
+
+	banks := []Bank{makeBank(0), makeBank(1), makeBank(2)}
+	failingBank := bankFunc(func(ctx context.Context) (func(), func(), error) {
+		return nil, nil, errors.New("boom")
+	})
+
+	orchestrator := NewCommitOrchestrator(append(banks, failingBank)...)
+	if err := orchestrator.CommitAll(context.Background()); err == nil {
+		t.Fatalf("expected error")
+	}
+
+	expected := []int{2, 1, 0}
+	if len(abortOrder) != len(expected) {
+		t.Fatalf("unexpected abort count: got %d want %d", len(abortOrder), len(expected))
+	}
+	for i, want := range expected {
+		if abortOrder[i] != want {
+			t.Fatalf("unexpected abort order at index %d: got %d want %d", i, abortOrder[i], want)
+		}
+	}
+
+	if orchestrator.Version() != 0 {
+		t.Fatalf("version advanced despite failure")
+	}
+
+	attempts, failures, _ := telemetry.DefaultCommitMetrics().Snapshot()
+	if attempts != 1 {
+		t.Fatalf("unexpected attempts count: got %d want %d", attempts, 1)
+	}
+	if failures != 1 {
+		t.Fatalf("unexpected failure count: got %d want %d", failures, 1)
+	}
+}
+
+func TestCommitAllCancelsContextDuringPreparation(t *testing.T) {
+	telemetry.DefaultCommitMetrics().Reset()
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	aborted := atomic.Bool{}
+
+	bank1 := bankFunc(func(ctx context.Context) (func(), func(), error) {
+		publish := func() {}
+		abort := func() { aborted.Store(true) }
+		return publish, abort, nil
+	})
+
+	bank2 := bankFunc(func(ctx context.Context) (func(), func(), error) {
+		cancel()
+		return nil, nil, ctx.Err()
+	})
+
+	orchestrator := NewCommitOrchestrator(bank1, bank2)
+	err := orchestrator.CommitAll(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !aborted.Load() {
+		t.Fatalf("expected first bank abort to run")
+	}
+	if orchestrator.Version() != 0 {
+		t.Fatalf("version advanced despite cancellation")
+	}
+
+	attempts, failures, _ := telemetry.DefaultCommitMetrics().Snapshot()
+	if attempts != 1 {
+		t.Fatalf("unexpected attempts count: got %d want %d", attempts, 1)
+	}
+	if failures != 1 {
+		t.Fatalf("unexpected failure count: got %d want %d", failures, 1)
+	}
+}
+
+func TestRegisterBank(t *testing.T) {
+	telemetry.DefaultCommitMetrics().Reset()
+
+	var publishCount atomic.Int32
+
+	firstBank := bankFunc(func(ctx context.Context) (func(), func(), error) {
+		return func() { publishCount.Add(1) }, nil, nil
+	})
+
+	orchestrator := NewCommitOrchestrator(firstBank)
+
+	if err := orchestrator.RegisterBank(nil); err == nil {
+		t.Fatalf("expected error when registering nil bank")
+	}
+
+	secondBank := bankFunc(func(ctx context.Context) (func(), func(), error) {
+		return func() { publishCount.Add(1) }, nil, nil
+	})
+	if err := orchestrator.RegisterBank(secondBank); err != nil {
+		t.Fatalf("registering bank failed: %v", err)
+	}
+
+	if err := orchestrator.CommitAll(context.Background()); err != nil {
+		t.Fatalf("commit failed: %v", err)
+	}
+
+	if publishCount.Load() != 2 {
+		t.Fatalf("unexpected publish count: got %d want %d", publishCount.Load(), 2)
+	}
+	if orchestrator.Version() != 1 {
+		t.Fatalf("unexpected version after commit: %d", orchestrator.Version())
+	}
+
+	attempts, failures, _ := telemetry.DefaultCommitMetrics().Snapshot()
+	if attempts != 1 {
+		t.Fatalf("unexpected attempts count: got %d want %d", attempts, 1)
+	}
+	if failures != 0 {
+		t.Fatalf("unexpected failure count: got %d want %d", failures, 0)
+	}
+}
+
+func BenchmarkCommitAll(b *testing.B) {
+	ctx := context.Background()
+	bankCounts := []int{1, 4, 16, 64}
+
+	for _, count := range bankCounts {
+		b.Run(fmt.Sprintf("%dBanks", count), func(b *testing.B) {
+			banks := make([]Bank, count)
+			for i := range banks {
+				banks[i] = bankFunc(func(ctx context.Context) (func(), func(), error) {
+					return func() {}, nil, nil
+				})
+			}
+
+			orchestrator := NewCommitOrchestrator(banks...)
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := orchestrator.CommitAll(ctx); err != nil {
+					b.Fatalf("commit failed: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func FuzzCommitAll(f *testing.F) {
+	f.Add([]byte{0})
+	f.Add([]byte{1})
+	f.Add([]byte{2})
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) == 0 {
+			t.Skip()
+		}
+
+		if len(data) > 8 {
+			data = data[:8]
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		orchestrator := NewCommitOrchestrator()
+
+		for i, b := range data {
+			mode := b % 4
+			idx := i
+
+			switch mode {
+			case 0:
+				orchestrator.RegisterBank(bankFunc(func(ctx context.Context) (func(), func(), error) {
+					return func() {}, nil, nil
+				}))
+			case 1:
+				orchestrator.RegisterBank(bankFunc(func(ctx context.Context) (func(), func(), error) {
+					return func() {}, func() {}, nil
+				}))
+			case 2:
+				orchestrator.RegisterBank(bankFunc(func(ctx context.Context) (func(), func(), error) {
+					return nil, nil, errors.New("prepare failed")
+				}))
+			case 3:
+				orchestrator.RegisterBank(bankFunc(func(ctx context.Context) (func(), func(), error) {
+					if idx%2 == 0 {
+						cancel()
+						return nil, nil, ctx.Err()
+					}
+					return func() {}, nil, nil
+				}))
+			}
+
+		}
+
+		err := orchestrator.CommitAll(ctx)
+		if err != nil {
+			if orchestrator.Version() != 0 {
+				t.Fatalf("version advanced despite error: %d", orchestrator.Version())
+			}
+		} else {
+			if orchestrator.Version() != 1 {
+				t.Fatalf("unexpected version on success: %d", orchestrator.Version())
+			}
+		}
+
+		// Ensure the orchestrator can be safely reused after fuzz scenario.
+		_ = orchestrator.RegisterBank(bankFunc(func(ctx context.Context) (func(), func(), error) {
+			return func() {}, nil, nil
+		}))
+	})
 }
