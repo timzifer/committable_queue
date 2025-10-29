@@ -11,9 +11,9 @@ import (
 	"github.com/timzifer/committable_queue/internal/telemetry"
 )
 
-type bankFunc func(ctx context.Context) error
+type bankFunc func(ctx context.Context) (func(), func(), error)
 
-func (f bankFunc) Commit(ctx context.Context) error {
+func (f bankFunc) PrepareCommit(ctx context.Context) (func(), func(), error) {
 	return f(ctx)
 }
 
@@ -29,17 +29,19 @@ func TestCommitAllIsSerialized(t *testing.T) {
 	banks := make([]Bank, 0, len(names))
 	for _, name := range names {
 		bankName := name
-		banks = append(banks, bankFunc(func(ctx context.Context) error {
-			current := running.Add(1)
-			if current > 1 {
-				concurrent.Store(true)
+		banks = append(banks, bankFunc(func(ctx context.Context) (func(), func(), error) {
+			publish := func() {
+				current := running.Add(1)
+				if current > 1 {
+					concurrent.Store(true)
+				}
+				time.Sleep(10 * time.Millisecond)
+				orderMu.Lock()
+				order = append(order, bankName)
+				orderMu.Unlock()
+				running.Add(-1)
 			}
-			time.Sleep(10 * time.Millisecond)
-			orderMu.Lock()
-			order = append(order, bankName)
-			orderMu.Unlock()
-			running.Add(-1)
-			return nil
+			return publish, nil, nil
 		}))
 	}
 
@@ -87,14 +89,18 @@ func TestCommitAllPublishesVersionAfterBanks(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 
-	bank1 := bankFunc(func(ctx context.Context) error {
-		close(started)
-		<-release
-		return nil
+	bank1 := bankFunc(func(ctx context.Context) (func(), func(), error) {
+		publish := func() {
+			close(started)
+			<-release
+		}
+		return publish, nil, nil
 	})
-	bank2 := bankFunc(func(ctx context.Context) error {
-		<-release
-		return nil
+	bank2 := bankFunc(func(ctx context.Context) (func(), func(), error) {
+		publish := func() {
+			<-release
+		}
+		return publish, nil, nil
 	})
 
 	orchestrator := NewCommitOrchestrator(bank1, bank2)
@@ -146,12 +152,16 @@ func TestCommitAllFailureDoesNotPublishVersion(t *testing.T) {
 	telemetry.DefaultCommitMetrics().Reset()
 
 	errCommit := errors.New("bank failure")
-	bank1 := bankFunc(func(ctx context.Context) error { return nil })
-	bank2 := bankFunc(func(ctx context.Context) error { return errCommit })
+	bank1 := bankFunc(func(ctx context.Context) (func(), func(), error) {
+		return func() {}, nil, nil
+	})
+	bank2 := bankFunc(func(ctx context.Context) (func(), func(), error) {
+		return nil, nil, errCommit
+	})
 	bank3Called := atomic.Bool{}
-	bank3 := bankFunc(func(ctx context.Context) error {
+	bank3 := bankFunc(func(ctx context.Context) (func(), func(), error) {
 		bank3Called.Store(true)
-		return nil
+		return func() {}, nil, nil
 	})
 
 	orchestrator := NewCommitOrchestrator(bank1, bank2, bank3)
@@ -164,6 +174,41 @@ func TestCommitAllFailureDoesNotPublishVersion(t *testing.T) {
 	}
 	if orchestrator.Version() != 0 {
 		t.Fatalf("version advanced despite failure")
+	}
+
+	attempts, failures, _ := telemetry.DefaultCommitMetrics().Snapshot()
+	if attempts != 1 {
+		t.Fatalf("unexpected attempts count: got %d want %d", attempts, 1)
+	}
+	if failures != 1 {
+		t.Fatalf("unexpected failure count: got %d want %d", failures, 1)
+	}
+}
+
+func TestCommitAllAbortsOnFailure(t *testing.T) {
+	telemetry.DefaultCommitMetrics().Reset()
+
+	abortedFirst := atomic.Bool{}
+
+	bank1 := bankFunc(func(ctx context.Context) (func(), func(), error) {
+		publish := func() {}
+		abort := func() { abortedFirst.Store(true) }
+		return publish, abort, nil
+	})
+	bank2 := bankFunc(func(ctx context.Context) (func(), func(), error) {
+		return nil, nil, errors.New("prepare failed")
+	})
+
+	orchestrator := NewCommitOrchestrator(bank1, bank2)
+	if err := orchestrator.CommitAll(context.Background()); err == nil {
+		t.Fatalf("expected error")
+	}
+
+	if abortedFirst.Load() != true {
+		t.Fatalf("first bank abort callback not invoked")
+	}
+	if orchestrator.Version() != 0 {
+		t.Fatalf("version advanced despite abort")
 	}
 
 	attempts, failures, _ := telemetry.DefaultCommitMetrics().Snapshot()

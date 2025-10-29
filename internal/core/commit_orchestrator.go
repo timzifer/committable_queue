@@ -10,8 +10,13 @@ import (
 )
 
 // Bank beschreibt eine Commit-fähige Partition.
+//
+// PrepareCommit liefert Publish-/Abort-Callbacks. Erst wenn alle Banken
+// erfolgreich vorbereitet wurden, ruft der Orchestrator die Publish-Callbacks
+// auf. Bei Fehlern oder Kontextabbruch werden die Abort-Callbacks in umgekehrter
+// Reihenfolge ausgeführt.
 type Bank interface {
-	Commit(ctx context.Context) error
+	PrepareCommit(ctx context.Context) (publish func(), abort func(), err error)
 }
 
 // CommitOrchestrator serialisiert Commits über alle bekannten Banken.
@@ -38,15 +43,48 @@ func (o *CommitOrchestrator) CommitAll(ctx context.Context) error {
 		return nil
 	}
 
+	publishes := make([]func(), 0, len(o.banks))
+	aborts := make([]func(), 0, len(o.banks))
+
+	var prepareErr error
 	for _, bank := range o.banks {
 		if err := ctx.Err(); err != nil {
-			finish(err)
-			return err
+			prepareErr = err
+			break
 		}
-		if err := bank.Commit(ctx); err != nil {
-			finish(err)
-			return err
+		publish, abort, err := bank.PrepareCommit(ctx)
+		if err != nil {
+			prepareErr = err
+			break
 		}
+		if publish == nil {
+			publish = func() {}
+		}
+		if abort == nil {
+			abort = func() {}
+		}
+		publishes = append(publishes, publish)
+		aborts = append(aborts, abort)
+	}
+
+	if prepareErr != nil {
+		for i := len(aborts) - 1; i >= 0; i-- {
+			aborts[i]()
+		}
+		finish(prepareErr)
+		return prepareErr
+	}
+
+	if err := ctx.Err(); err != nil {
+		for i := len(aborts) - 1; i >= 0; i-- {
+			aborts[i]()
+		}
+		finish(err)
+		return err
+	}
+
+	for _, publish := range publishes {
+		publish()
 	}
 
 	o.version.Add(1)

@@ -1,6 +1,7 @@
 package queue
 
 import (
+	"context"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -188,5 +189,92 @@ func TestSegmentedQueueCommitOverflowDropNewest(t *testing.T) {
 
 	if _, ok := q.PopFront(); ok {
 		t.Fatalf("queue should contain only %d elements after overflow handling", len(expected))
+	}
+}
+
+func TestSegmentedQueuePrepareCommitAbortRestoresPending(t *testing.T) {
+	q := NewSegmentedQueue[int]()
+	q.PushBackPending(1)
+	q.PushBackPending(2)
+
+	publish, abort, err := q.PrepareCommit(context.Background())
+	if err != nil {
+		t.Fatalf("prepare failed: %v", err)
+	}
+	if publish == nil || abort == nil {
+		t.Fatalf("expected publish and abort callbacks")
+	}
+
+	q.PushBackPending(3)
+	abort()
+
+	if got := q.LenVisible(); got != 0 {
+		t.Fatalf("visible segment should remain unchanged after abort, got len %d", got)
+	}
+
+	q.Commit()
+
+	expected := []int{1, 2, 3}
+	for i, want := range expected {
+		got, ok := q.PopFront()
+		if !ok || got != want {
+			t.Fatalf("post-abort commit pop %d expected %d got %v,%v", i, want, got, ok)
+		}
+	}
+}
+
+func TestSegmentedQueuePrepareCommitPublishExcludesNewPending(t *testing.T) {
+	q := NewSegmentedQueue[int]()
+	q.PushBackPending(10)
+	q.PushBackPending(11)
+
+	publish, abort, err := q.PrepareCommit(context.Background())
+	if err != nil {
+		t.Fatalf("prepare failed: %v", err)
+	}
+	if abort == nil {
+		t.Fatalf("expected abort callback")
+	}
+
+	q.PushBackPending(12)
+	publish()
+
+	values := []int{}
+	for {
+		if v, ok := q.PopFront(); ok {
+			values = append(values, v)
+		} else {
+			break
+		}
+	}
+
+	if len(values) != 2 || values[0] != 10 || values[1] != 11 {
+		t.Fatalf("visible segment contained unexpected values after publish: %v", values)
+	}
+
+	q.Commit()
+	if v, ok := q.PopFront(); !ok || v != 12 {
+		t.Fatalf("pending element added after prepare should commit later, got %v,%v", v, ok)
+	}
+}
+
+func TestSegmentedQueuePrepareCommitRespectsContext(t *testing.T) {
+	q := NewSegmentedQueue[int]()
+	q.PushBackPending(1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	publish, abort, err := q.PrepareCommit(ctx)
+	if err == nil {
+		t.Fatalf("expected context cancellation error")
+	}
+	if publish != nil || abort != nil {
+		t.Fatalf("callbacks must be nil on failure")
+	}
+
+	q.Commit()
+	if v, ok := q.PopFront(); !ok || v != 1 {
+		t.Fatalf("pending element should remain after cancelled prepare, got %v,%v", v, ok)
 	}
 }
