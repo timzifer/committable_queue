@@ -20,3 +20,9 @@ Dieses Dokument beschreibt das Commit-Protokoll der Queue-Banken und den orchest
 * **Rollback durch Auslassung:** Da Leser erst nach erfolgreichem Abschluss aller Banken umgeschaltet werden, verbleiben sie beim vorherigen konsistenten Zustand.
 * **Metriken & Tracing:** Jeder Commit-Versuch meldet Dauer und Fehlversuche an `internal/telemetry/commit_metrics.go`. Fehlversuche werden gezählt und können von außen beobachtet werden.
 * **Fehlerpropagierung:** Der Fehler der Bank wird unverändert an den Aufrufer von `CommitAll` zurückgegeben. Zusätzlich bricht ein abgebrochener Kontext den Commit mit dem jeweiligen Kontextfehler ab.
+
+## Deterministische Mehrregister-Lesevorgänge
+
+* **Versionskonsistenz:** Multi-Register-Reader (z. B. Modbus-Clients) dürfen nur Wertepaare verarbeiten, deren `Version` und `Timestamp` identisch sind. Sichtbare Register werden erst nach erfolgreichem `CommitAll` aktualisiert.
+* **Staging der Writer:** Writer aktualisieren pro Bank zunächst Pending-Register. Selbst wenn mehrere Writer parallel schreiben, wechseln Reader erst nach dem orchestrierten Commit auf den neuen Snapshot.
+* **Sichtbarkeit:** Während `CommitAll` läuft, bleiben Reader auf dem zuletzt veröffentlichten Snapshot. Erst wenn alle Banken committed und die globale Version erhöht wurde, erscheinen die neuen Registerwerte atomar für alle beteiligten Banken.
