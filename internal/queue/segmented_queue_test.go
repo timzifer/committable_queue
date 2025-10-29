@@ -142,3 +142,51 @@ func TestSegmentedQueueConcurrentReadersAndWriters(t *testing.T) {
 		}
 	}
 }
+
+func TestSegmentedQueueCommitOverflowDropOldest(t *testing.T) {
+	q := NewSegmentedQueue[int](
+		WithInitialVisible(1, 2),
+		WithOptions[int](Options{MaxLen: 3, DropPolicy: DropOldest}),
+	)
+
+	q.PushBackPending(3)
+	q.PushBackPending(4)
+
+	q.Commit()
+
+	expected := []int{2, 3, 4}
+	for i, want := range expected {
+		got, ok := q.PopFront()
+		if !ok || got != want {
+			t.Fatalf("after commit drop-oldest pop %d expected %d got %v,%v", i, want, got, ok)
+		}
+	}
+
+	if _, ok := q.PopFront(); ok {
+		t.Fatalf("queue should contain only %d elements after overflow handling", len(expected))
+	}
+}
+
+func TestSegmentedQueueCommitOverflowDropNewest(t *testing.T) {
+	q := NewSegmentedQueue[int](
+		WithInitialVisible(1, 2),
+		WithOptions[int](Options{MaxLen: 3, DropPolicy: DropNewest}),
+	)
+
+	q.PushBackPending(3)
+	q.PushBackPending(4)
+
+	q.Commit()
+
+	expected := []int{1, 2, 3}
+	for i, want := range expected {
+		got, ok := q.PopFront()
+		if !ok || got != want {
+			t.Fatalf("after commit drop-newest pop %d expected %d got %v,%v", i, want, got, ok)
+		}
+	}
+
+	if _, ok := q.PopFront(); ok {
+		t.Fatalf("queue should contain only %d elements after overflow handling", len(expected))
+	}
+}
