@@ -153,10 +153,12 @@ func TestMultiBankCommitProducesConsistentSnapshot(t *testing.T) {
 	}()
 
 	errCh := make(chan error, 1)
-	go func() {
-		err := orchestrator.CommitAll(context.Background())
-		errCh <- err
+	ctx := core.WithCommitObserver(context.Background(), func(err error) {
 		close(commitDone)
+	})
+	go func() {
+		err := orchestrator.CommitAll(ctx)
+		errCh <- err
 	}()
 
 	select {
