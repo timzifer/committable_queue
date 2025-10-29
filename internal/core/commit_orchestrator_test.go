@@ -354,6 +354,66 @@ func TestRegisterBank(t *testing.T) {
 	}
 }
 
+func TestCommitObserverRunsBeforePublish(t *testing.T) {
+	var orderMu sync.Mutex
+	order := make([]string, 0, 2)
+
+	bank := bankFunc(func(ctx context.Context) (func(), func(), error) {
+		publish := func() {
+			orderMu.Lock()
+			order = append(order, "publish")
+			orderMu.Unlock()
+		}
+		return publish, nil, nil
+	})
+
+	orchestrator := NewCommitOrchestrator(bank)
+
+	ctx := WithCommitObserver(context.Background(), func(err error) {
+		if err != nil {
+			t.Fatalf("unexpected observer error: %v", err)
+		}
+		orderMu.Lock()
+		order = append(order, "observer")
+		orderMu.Unlock()
+	})
+
+	if err := orchestrator.CommitAll(ctx); err != nil {
+		t.Fatalf("commit failed: %v", err)
+	}
+
+	orderMu.Lock()
+	defer orderMu.Unlock()
+	if len(order) != 2 {
+		t.Fatalf("unexpected callback count: %d", len(order))
+	}
+	if order[0] != "observer" || order[1] != "publish" {
+		t.Fatalf("unexpected callback order: %v", order)
+	}
+}
+
+func TestCommitObserverReceivesError(t *testing.T) {
+	errPrepare := errors.New("prepare failed")
+	bank := bankFunc(func(ctx context.Context) (func(), func(), error) {
+		return nil, nil, errPrepare
+	})
+
+	orchestrator := NewCommitOrchestrator(bank)
+
+	var observed error
+	ctx := WithCommitObserver(context.Background(), func(err error) {
+		observed = err
+	})
+
+	err := orchestrator.CommitAll(ctx)
+	if !errors.Is(err, errPrepare) {
+		t.Fatalf("unexpected commit error: %v", err)
+	}
+	if !errors.Is(observed, errPrepare) {
+		t.Fatalf("observer saw wrong error: %v", observed)
+	}
+}
+
 func BenchmarkCommitAll(b *testing.B) {
 	ctx := context.Background()
 	bankCounts := []int{1, 4, 16, 64}
